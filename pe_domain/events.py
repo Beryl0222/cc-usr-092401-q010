@@ -146,24 +146,33 @@ def assess_session(
     flags: list[str] = []
     occ = report.occasion
 
-    # ---- 学生侧：去重 + 离线时限 ----
+    # ---- 学生侧：离线时限判定 + 去重（对事件到达顺序不敏感）----
+    # 先按事件自身属性判定时效：迟到/超时补签无论何时重放、相对在线签到
+    # 先后如何，结论都一致（留痕 offline_late，不计入）。
     unique: dict[str, SampleAttendance] = {}
     duplicate_tokens: set[str] = set()
+    late_tokens: set[str] = set()
+    valid: list[SampleAttendance] = []
     for att in attendances:
         if att.occasion != occ:
-            continue
-        if att.token in unique:
-            # 重复签到：保留最早一条，重复仅标记，绝不增加时长
-            duplicate_tokens.add(att.token)
-            if att.occurred_at < unique[att.token].occurred_at:
-                unique[att.token] = att
             continue
         if att.source == "offline":
             delay = _hours_between(att.received_at, att.occurred_at)
             if delay > OFFLINE_ACCEPT_HOURS:
-                flags.append(f"offline_late:{att.token}")
+                late_tokens.add(att.token)
                 continue  # 超时限：留痕于账本但不计入
-        unique[att.token] = att
+        valid.append(att)
+    # 再在有效签到内按 (到场时刻, 来源, 设备) 稳定去重，重复仅标记，绝不增加时长
+    for att in sorted(
+        valid,
+        key=lambda a: (a.occurred_at, 0 if a.source == "online" else 1, a.device_id),
+    ):
+        if att.token in unique:
+            duplicate_tokens.add(att.token)
+        else:
+            unique[att.token] = att
+    for token in sorted(late_tokens):
+        flags.append(f"offline_late:{token}")
     for token in sorted(duplicate_tokens):
         flags.append(f"duplicate_signin:{token}")
 

@@ -76,20 +76,24 @@ def detect_anomalies(class_id: str, reconstructed: dict) -> list[Anomaly]:
     """
     findings: list[Anomaly] = []
     sessions = reconstructed["sessions"]          # 按时间排序的会话
-    missing = reconstructed["missing_occasions"]  # 方案有、无任何事件
     takeovers = reconstructed["takeovers"]
     flags_by_occasion = reconstructed["flags"]
 
-    # 阴阳课表：方案场次完全无事件（排除已挂接补课与合规调课）
+    # 阴阳课表：方案场次无有效交付（排除合规改期/取消与已由补课兑现的场次）。
+    # 补课尝试失败（makeup_unconfirmed）不能证明交付，仍按缺口提示。
+    states = reconstructed["states"]
+    delivered = reconstructed["made_up"] | set(reconstructed["rescheduled"]) | set(
+        reconstructed.get("cancelled", {})
+    )
     truly_missing = [
-        k for k in missing
-        if k not in reconstructed["made_up"] and k not in reconstructed["rescheduled"]
+        k for k, st in states.items()
+        if st in ("missing", "makeup_unconfirmed") and k not in delivered
     ]
     if truly_missing:
         findings.append(Anomaly(
             class_id, AnomalyKind.YIN_YANG,
             tuple(sorted(truly_missing)),
-            f"{len(truly_missing)} 个课表场次无任何授课/场地/学生事件",
+            f"{len(truly_missing)} 个课表场次无有效交付（无事件或补课未确认）",
         ))
 
     # 连续应考训练 / 自由活动

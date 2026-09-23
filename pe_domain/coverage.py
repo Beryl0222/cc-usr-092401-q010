@@ -5,20 +5,26 @@
 
 口径：
 
-- 教会：在该技能 teach_weeks 内（或挂接该周缺课的补课），至少有 1 场
+- 教会：在该技能 teach_weeks 内（或回填该周缺课的补课），至少有 1 场
   经确认、且实际教授该技能的体育课。自由活动/纯应考训练不计。
 - 勤练：practice_weeks 内，体育课/大课间/课后服务中实际练习该技能的
-  确认场次达到计划数（方案中这些周的相关 slot 数）。
-- 常赛：match_weeks 内，经确认的班级赛事场次达到计划数。
+  确认场次按周去重命中的周数占比。
+- 常赛：match_weeks 内，经确认的班级赛事场次占比。
 - 调课：以审批通过的 ScheduleChange 为准，按调整后的时间核对。
-- 补课：MAKEUP 场次回填其 makeup_for 指向的原场次，原场次记为补课后完成。
+- 补课：MAKEUP 场次只是原场次的履约证据，**按其挂接原场次所在周归类**；
+  一次原场次最多接受一个有效补课结果（账本中该原场次生效安排上、经三方
+  确认的那一条，见 ledger.rebuild_class 的 completion_evidence）。被取代
+  的旧安排、补课失败的会话不产生任何技能覆盖，同一原周次不会被多条补课
+  重复计入。
+- 伤病适配只折减学生本人时长，不影响场次成立与否，因此不改变班级覆盖。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .events import SessionMode
+from .ledger import PENDING_STATES
 from .models import ActivityKind
 
 # 可产生“教会/勤练”技能覆盖的形态（自由活动、纯应考训练排除）
@@ -49,6 +55,8 @@ class ClassCoverage:
     pending_makeup: int
     in_review: int
     skill_coverage: tuple[SkillCoverage, ...]
+    # 原场次 key -> 履约证据（补课场次 key），与 completed 中“补课后完成”一一对应
+    completion_evidence: dict[str, str] = field(default_factory=dict)
 
     @property
     def completion_ratio(self) -> float:
@@ -59,13 +67,14 @@ def _week_of(occasion_key: str) -> int:
     return int(occasion_key.rsplit("w", 1)[1])
 
 
-def compute_skill_coverage(goal, confirmed_sessions, *, rescheduled_weeks=None):
-    """confirmed_sessions: ledger 重建后的已确认会话列表（对象含 occasion/taught_skill/mode/kind）。
+def compute_skill_coverage(goal, confirmed_sessions, *, accepted_makeup_keys=None):
+    """confirmed_sessions: ledger 重建后的已确认会话列表（含 occasion/taught_skill/mode/kind）。
 
-    rescheduled_weeks: 调课生效后，原 slot 在某周改期的集合（视为该周仍有安排），
-    用于避免把合规调课误判为缺口。
+    accepted_makeup_keys: 被采纳为原场次有效履约结果的补课场次 key 集合
+    （completion_evidence 的值）。MAKEUP 会话只有在其中才计覆盖，
+    保证一次原周次至多被一条补课归入。
     """
-    rescheduled_weeks = rescheduled_weeks or set()
+    accepted_makeup_keys = accepted_makeup_keys or frozenset()
     evidence: list[str] = []
     taught_weeks_hit: set[int] = set()
     practice_weeks_hit: set[int] = set()
@@ -75,13 +84,16 @@ def compute_skill_coverage(goal, confirmed_sessions, *, rescheduled_weeks=None):
     gaps: list[str] = []
 
     for s in confirmed_sessions:
-        week = _week_of(s.occasion.key())
         key = s.occasion.key()
         if s.taught_skill != goal.skill_code or s.mode not in SKILL_GRANTING_MODES:
             continue
-        # 补课按其挂接原场次所在周归类
-        if s.mode == SessionMode.MAKEUP and s.makeup_for is not None:
+        if s.mode == SessionMode.MAKEUP:
+            # 仅采纳生效安排上、确认通过的那一条；按挂接原场次所在周归类
+            if s.makeup_for is None or key not in accepted_makeup_keys:
+                continue
             week = _week_of(s.makeup_for.key())
+        else:
+            week = _week_of(key)
         if s.kind is ActivityKind.PE_CLASS:
             if week in goal.teach_weeks:
                 taught_weeks_hit.add(week)
@@ -113,7 +125,7 @@ def compute_skill_coverage(goal, confirmed_sessions, *, rescheduled_weeks=None):
         taught=taught,
         practiced_ratio=min(1.0, round(practiced / practiced_planned, 3)) if practiced_planned else 1.0,
         matched_ratio=min(1.0, round(matched / matched_planned, 3)) if matched_planned else 1.0,
-        evidence=tuple(sorted(evidence)),
+        evidence=tuple(sorted(set(evidence))),
         gaps=tuple(gaps),
     )
 
@@ -123,25 +135,36 @@ def compute_class_coverage(
     rebuilt: dict,
     skill_goals,
 ) -> ClassCoverage:
-    """rebuilt 为 ledger.rebuild_class() 的输出。"""
+    """rebuilt 为 ledger.rebuild_class() 的输出。
+
+    总场次 = 计划场次（states 的全部键）；补课场次不是独立分母行。
+    """
     states = rebuilt["states"]
-    planned_occasions = {k: {"state": v} for k, v in states.items()}
-    completed = sum(1 for v in planned_occasions.values() if v["state"] == "completed")
-    pending = sum(
-        1 for v in planned_occasions.values()
-        if v["state"] in ("taken_over", "missing", "weather_pending")
-    )
-    in_review = sum(1 for v in planned_occasions.values() if v["state"] == "in_review")
-    sessions = [s for s in rebuilt["sessions"] if s.confirmed]
+    completed = sum(1 for st in states.values() if st == "completed")
+    pending = sum(1 for st in states.values() if st in PENDING_STATES)
+    in_review = sum(1 for st in states.values() if st == "in_review")
+
+    # 只有被采纳的补课证据才能产生技能覆盖（一次原场次一条）
+    completion_evidence: dict[str, str] = rebuilt.get("completion_evidence", {})
+    accepted_makeup_keys = frozenset(completion_evidence.values())
+    sessions = [
+        s for s in rebuilt["sessions"]
+        if s.confirmed and (
+            s.mode is not SessionMode.MAKEUP or s.occasion.key() in accepted_makeup_keys
+        )
+    ]
     skill_cov = tuple(
-        compute_skill_coverage(goal, sessions)
+        compute_skill_coverage(
+            goal, sessions, accepted_makeup_keys=accepted_makeup_keys,
+        )
         for goal in skill_goals
     )
     return ClassCoverage(
         class_id=class_id,
-        total_occasions=len(planned_occasions),
+        total_occasions=len(states),
         completed=completed,
         pending_makeup=pending,
         in_review=in_review,
         skill_coverage=skill_cov,
+        completion_evidence=dict(completion_evidence),
     )

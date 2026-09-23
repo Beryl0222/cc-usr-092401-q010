@@ -567,5 +567,376 @@ class VisibilityTest(unittest.TestCase):
         self.assertAlmostEqual(summary.occasions_completed_ratio, 0.9)
 
 
+# ---------------------------------------------------------------- 补课口径：唯一分母与履约证据
+
+class MakeupAccountingTest(unittest.TestCase):
+    """计划场次是唯一分母；补课只是原场次的履约证据；一次原场次一条有效结果。"""
+
+    def setUp(self):
+        self.slots = five_pe_slots("C1")
+        self.original = Occasion("C1-PE-1", 1)
+        self.host_a = Occasion("C1-PE-1", 2)
+        self.host_b = Occasion("C1-PE-1", 3)
+
+    def _fill_all_normal(self, ledger, current_week, *, skip=()):
+        """除 skip 的场次外，1..current_week 全部正常交付（已记录的场次不重复追加）。"""
+        recorded = {
+            e.payload.occasion for e in ledger.entries("teacher_report")
+        }
+        for w in range(1, current_week + 1):
+            for slot in self.slots:
+                occ = Occasion(slot.slot_id, w)
+                if occ in skip or occ in recorded:
+                    continue
+                ledger.append("teacher_report", TeacherReport(
+                    occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+                    SessionMode.NORMAL, "V-FIELD"))
+                ledger.append("venue_observation", VenueObservation(occ, "V-FIELD", 40))
+                for i in range(4):
+                    ledger.append("sample_attendance",
+                                  att(f"t{w}-{slot.slot_id}-{i}", occ, f"2026-09-0{w}T10:00:00"))
+
+    def _makeup_session(self, ledger, host, *, tokens=4, when="2026-09-14T10:00:00"):
+        ledger.append("teacher_report", TeacherReport(
+            host, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+            SessionMode.MAKEUP, "V-GYM", basis_ref="MK-01",
+            makeup_for=self.original))
+        ledger.append("venue_observation", VenueObservation(host, "V-GYM", 40))
+        for i in range(tokens):
+            ledger.append("sample_attendance",
+                          att(f"mk-{host.week}-{i}", host, when))
+
+    def _denominator_invariants(self, rebuilt, coverage):
+        states = rebuilt["states"]
+        # 分母只含计划场次：5 slot × 3 周 = 15，补课场次不另立行
+        self.assertEqual(coverage.total_occasions, 15)
+        self.assertEqual(len(states), 15)
+        # 状态互斥且穷尽：完成 + 待补 + 在复核 + 改期 + 取消 == 总场次
+        buckets = (
+            coverage.completed + coverage.pending_makeup + coverage.in_review
+            + sum(1 for st in states.values() if st == "rescheduled")
+            + sum(1 for st in states.values() if st == "cancelled")
+        )
+        self.assertEqual(buckets, 15)
+        # 证据只指向“补课后完成”的原场次，且引用的补课会话真实存在
+        self.assertEqual(set(rebuilt["completion_evidence"]), rebuilt["made_up"])
+        confirmed_makeup_sessions = {
+            s.occasion.key() for s in rebuilt["sessions"]
+            if s.confirmed and s.mode == SessionMode.MAKEUP
+        }
+        for okey, mkey in rebuilt["completion_evidence"].items():
+            self.assertEqual(states[okey], "completed")
+            self.assertIn(mkey, confirmed_makeup_sessions)
+
+    def test_two_plans_two_confirmed_makeups_only_one_counts(self):
+        ledger = EventLedger()
+        # 原场次被占课缺课
+        ledger.append("takeover", {"slot_id": "C1-PE-1", "week": 1,
+                                   "subject": "数学", "ref": ""})
+        # 先后两个补课计划（A 在第 2 周，B 在第 3 周），两场补课都实际完成
+        ledger.append("makeup_plan", {"occasion": self.host_a, "makeup_for": self.original})
+        self._makeup_session(ledger, self.host_a, when="2026-09-14T10:00:00")
+        ledger.append("makeup_plan", {"occasion": self.host_b, "makeup_for": self.original})
+        self._makeup_session(ledger, self.host_b, when="2026-09-21T10:00:00")
+        self._fill_all_normal(ledger, 3, skip=(self.original, self.host_a, self.host_b))
+
+        rebuilt = ledger.rebuild_class(
+            "C1", self.slots, HEADCOUNT, {}, {}, VENUES, current_week=3)
+        coverage = compute_class_coverage("C1", rebuilt, (GOAL_BB,))
+
+        # 原场次由最后的生效安排（B）兑现，只完成一次；旧安排留档 superseded
+        self.assertEqual(rebuilt["states"]["C1-PE-1#w1"], "completed")
+        self.assertEqual(rebuilt["completion_evidence"]["C1-PE-1#w1"], "C1-PE-1#w3")
+        self.assertEqual(rebuilt["makeup_schedule"]["C1-PE-1#w1"], "C1-PE-1#w3")
+        self.assertIn(("C1-PE-1#w1", "C1-PE-1#w2"),
+                      rebuilt["makeup_plans_superseded"])
+        records = {(r.original_key, r.makeup_key): r for r in rebuilt["makeup_records"]}
+        self.assertTrue(records[("C1-PE-1#w1", "C1-PE-1#w3")].fulfilled)
+        self.assertTrue(records[("C1-PE-1#w1", "C1-PE-1#w3")].effective)
+        self.assertFalse(records[("C1-PE-1#w1", "C1-PE-1#w2")].fulfilled)
+        self.assertFalse(records[("C1-PE-1#w1", "C1-PE-1#w2")].effective)
+        # 待补为 0，分母不被补课场次放大
+        self.assertEqual(coverage.pending_makeup, 0)
+        self._denominator_invariants(rebuilt, coverage)
+
+        # 技能覆盖：第 1 周教会目标只被生效补课（B）归入一次，A 不产生覆盖
+        bb = coverage.skill_coverage[0]
+        self.assertTrue(bb.taught)
+        self.assertIn("teach:C1-PE-1#w3", bb.evidence)
+        self.assertNotIn("teach:C1-PE-1#w2", bb.evidence)
+        teach_evidence = [e for e in bb.evidence if e.startswith("teach:")]
+        self.assertEqual(len(teach_evidence), len(set(teach_evidence)))
+
+    def test_failed_makeup_keeps_original_pending_then_replan_fulfills(self):
+        ledger = EventLedger()
+        ledger.append("takeover", {"slot_id": "C1-PE-1", "week": 1,
+                                   "subject": "数学", "ref": ""})
+        # 第一版补课：三方确认未过（抽样仅 2 人）
+        ledger.append("makeup_plan", {"occasion": self.host_a, "makeup_for": self.original})
+        self._makeup_session(ledger, self.host_a, tokens=2)
+        self._fill_all_normal(ledger, 2, skip=(self.original, self.host_a))
+
+        rebuilt = ledger.rebuild_class(
+            "C1", self.slots, HEADCOUNT, {}, {}, VENUES, current_week=2)
+        self.assertEqual(rebuilt["states"]["C1-PE-1#w1"], "makeup_unconfirmed")
+        self.assertIn("C1-PE-1#w1", rebuilt["pending_makeup"])
+        self.assertEqual(rebuilt["states"]["C1-PE-1#w2"], "in_review")
+        self.assertNotIn("C1-PE-1#w1", rebuilt["made_up"])
+        cov1 = compute_class_coverage("C1", rebuilt, (GOAL_BB,))
+        self.assertEqual(cov1.completion_evidence, {})
+        # 失败的补课会话不产生任何技能覆盖证据
+        self.assertFalse(
+            any(e.endswith("C1-PE-1#w2") for e in cov1.skill_coverage[0].evidence))
+
+        # 失败后重排：第 3 周新计划并确认通过 -> 原场次回填完成
+        ledger.append("makeup_plan", {"occasion": self.host_b, "makeup_for": self.original})
+        self._makeup_session(ledger, self.host_b, when="2026-09-21T10:00:00")
+        self._fill_all_normal(ledger, 3, skip=(self.original, self.host_a, self.host_b))
+        rebuilt2 = ledger.rebuild_class(
+            "C1", self.slots, HEADCOUNT, {}, {}, VENUES, current_week=3)
+        self.assertEqual(rebuilt2["states"]["C1-PE-1#w1"], "completed")
+        self.assertEqual(rebuilt2["completion_evidence"]["C1-PE-1#w1"], "C1-PE-1#w3")
+        self.assertNotIn("C1-PE-1#w1", rebuilt2["pending_makeup"])
+        # 失败的补课场次保留在复核状态，不被抹掉
+        self.assertEqual(rebuilt2["states"]["C1-PE-1#w2"], "in_review")
+        cov2 = compute_class_coverage("C1", rebuilt2, (GOAL_BB,))
+        self._denominator_invariants(rebuilt2, cov2)
+        self.assertTrue(cov2.skill_coverage[0].taught)
+        self.assertIn("teach:C1-PE-1#w3", cov2.skill_coverage[0].evidence)
+        self.assertNotIn("teach:C1-PE-1#w2", cov2.skill_coverage[0].evidence)
+
+    def test_cancellation_reschedule_takeover_weather_keep_distinct_states(self):
+        ledger = EventLedger()
+        from pe_domain.events import ScheduleChange
+        ledger.append("cancellation", {"occasion": Occasion("C1-PE-1", 1),
+                                       "reason": "考务统一安排", "ref": "ADM-1"})
+        ledger.append("schedule_change", ScheduleChange(
+            Occasion("C1-PE-2", 1), new_weekday=3, new_venue_id="V-GYM",
+            new_teacher_id="T-WANG", approver="principal", basis_ref="ADJ-09"))
+        ledger.append("takeover", {"slot_id": "C1-PE-3", "week": 1,
+                                   "subject": "数学", "ref": ""})
+        ledger.append("weather_trigger",
+                       {"occasion": Occasion("C1-PE-4", 1),
+                        "condition": "rain", "policy_ref": "POL-RAIN-01"})
+        self._fill_all_normal(ledger, 1, skip=tuple(
+            Occasion(f"C1-PE-{d}", 1) for d in (1, 2, 3, 4)))
+        rebuilt = ledger.rebuild_class(
+            "C1", self.slots, HEADCOUNT, {}, {}, VENUES, current_week=1)
+        states = rebuilt["states"]
+        self.assertEqual(states["C1-PE-1#w1"], "cancelled")
+        self.assertEqual(states["C1-PE-2#w1"], "rescheduled")
+        self.assertEqual(states["C1-PE-3#w1"], "taken_over")
+        self.assertEqual(states["C1-PE-4#w1"], "weather_pending")
+        # 取消不构成待补缺口；占课/天气待替代才待补
+        pending = set(rebuilt["pending_makeup"])
+        self.assertNotIn("C1-PE-1#w1", pending)
+        self.assertNotIn("C1-PE-2#w1", pending)
+        self.assertIn("C1-PE-3#w1", pending)
+        self.assertIn("C1-PE-4#w1", pending)
+
+    def test_already_delivered_occasion_is_not_overwritten_by_makeup(self):
+        ledger = EventLedger()
+        self._fill_all_normal(ledger, 3)  # 原场次第 1 周已正常完成
+        ledger.append("makeup_plan", {"occasion": self.host_a, "makeup_for": self.original})
+        self._makeup_session(ledger, self.host_a)
+        rebuilt = ledger.rebuild_class(
+            "C1", self.slots, HEADCOUNT, {}, {}, VENUES, current_week=3)
+        # 原场次维持自行完成，补课证据不回填、不重复计完成
+        self.assertEqual(rebuilt["states"]["C1-PE-1#w1"], "completed")
+        self.assertNotIn("C1-PE-1#w1", rebuilt["completion_evidence"])
+        self.assertNotIn("C1-PE-1#w1", rebuilt["made_up"])
+
+
+# ---------------------------------------------------------------- 乱序与迟到事件重放
+
+class ReplayDeterminismTest(unittest.TestCase):
+    """乱序追加、迟到补签、计划晚于会话到达，重放结论唯一确定。"""
+
+    def _events_scenario(self):
+        slots = five_pe_slots("C1")
+        original = Occasion("C1-PE-2", 1)
+        host = Occasion("C1-PE-1", 2)
+
+        def make_events():
+            evs = []
+            evs.append(("takeover", {"slot_id": "C1-PE-2", "week": 1,
+                                     "subject": "数学", "ref": ""}))
+            # 补课会话三方事件
+            evs.append(("teacher_report", TeacherReport(
+                host, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+                SessionMode.MAKEUP, "V-GYM", basis_ref="MK-01",
+                makeup_for=original)))
+            evs.append(("venue_observation", VenueObservation(host, "V-GYM", 40)))
+            for i in range(4):
+                evs.append(("sample_attendance",
+                            att(f"mk{i}", host, "2026-09-14T10:00:00")))
+            # 一条超时离线补签（49 小时），无论相对在线签到先后都只留痕
+            evs.append(("sample_attendance",
+                        att("late", host, "2026-09-14T10:00:00",
+                            source="offline", received="2026-09-16T11:00:00")))
+            # 补课计划晚于会话事件才入账
+            evs.append(("makeup_plan", {"occasion": host, "makeup_for": original}))
+            # 其余计划场次正常交付
+            for w in range(1, 3):
+                for slot in slots:
+                    occ = Occasion(slot.slot_id, w)
+                    if occ in (original, host):
+                        continue
+                    evs.append(("teacher_report", TeacherReport(
+                        occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+                        SessionMode.NORMAL, "V-FIELD")))
+                    evs.append(("venue_observation", VenueObservation(occ, "V-FIELD", 40)))
+                    for i in range(4):
+                        evs.append(("sample_attendance",
+                                    att(f"t{w}-{i}", occ, f"2026-09-0{w + 6}T10:00:00")))
+            return evs
+        return slots, original, host, make_events
+
+    def _fingerprint(self, ledger, slots):
+        rebuilt = ledger.rebuild_class(
+            "C1", slots, HEADCOUNT, {}, {}, VENUES, current_week=2)
+        coverage = compute_class_coverage("C1", rebuilt, (GOAL_BB,))
+        return (
+            tuple(sorted(rebuilt["states"].items())),
+            rebuilt["pending_makeup"],
+            tuple(sorted(rebuilt["made_up"])),
+            tuple(sorted(rebuilt["completion_evidence"].items())),
+            tuple(sorted((s.occasion.key(), s.flags) for s in rebuilt["sessions"])),
+            coverage.total_occasions,
+            coverage.completed,
+            coverage.pending_makeup,
+            tuple((c.skill_code, c.taught, c.practiced_ratio, c.matched_ratio, c.evidence)
+                  for c in coverage.skill_coverage),
+        )
+
+    def test_out_of_order_and_late_replay_is_deterministic(self):
+        import random
+        slots, original, host, make_events = self._events_scenario()
+
+        fingerprints = set()
+        for seed in range(8):
+            ledger = EventLedger()
+            evs = make_events()
+            rng = random.Random(seed)
+            rng.shuffle(evs)
+            for et, p in evs:
+                ledger.append(et, p)
+            fingerprints.add(self._fingerprint(ledger, slots))
+        self.assertEqual(len(fingerprints), 1)
+
+        fp = next(iter(fingerprints))
+        states_items, pending, made_up, evidence, flags, total, completed, pending_n, skills = fp
+        states = dict(states_items)
+        # 计划晚于会话到达：原场次仍被该补课兑现；超时补签不影响结论
+        self.assertEqual(states["C1-PE-2#w1"], "completed")
+        self.assertEqual(dict(evidence)["C1-PE-2#w1"], "C1-PE-1#w2")
+        self.assertEqual(pending, ())
+        self.assertEqual(total, 10)  # 5 slot × 2 周
+        self.assertEqual(completed, 10)
+        self.assertTrue(any("offline_late:late" in fl for _, fl in flags))
+
+
+# ---------------------------------------------------------------- 公众汇总一致性
+
+class PublicSummaryConsistencyTest(unittest.TestCase):
+    def _three_class_coverages(self):
+        """用真实账本构造 3 个班，每班 1 周 5 场：3 完成 / 1 占课待补 / 1 天气待补。"""
+        coverages = {}
+        evidence_total = 0
+        for cid, teacher, venue in (
+            ("C1", T_WANG, "V-FIELD"),
+            ("C2", T_CHEN, "V-FIELD-2"),
+            ("C3", T_ZHAO, "V-FIELD-3"),
+        ):
+            ledger = EventLedger()
+            slots = five_pe_slots(cid)
+            for day in (1, 2, 3):
+                occ = Occasion(f"{cid}-PE-{day}", 1)
+                ledger.append("teacher_report", TeacherReport(
+                    occ, teacher.teacher_id, ActivityKind.PE_CLASS, "BB", 40,
+                    SessionMode.NORMAL, venue))
+                ledger.append("venue_observation", VenueObservation(occ, venue, 40))
+                for i in range(4):
+                    ledger.append("sample_attendance", att(f"t{i}", occ, "2026-09-07T10:00:00"))
+            ledger.append("takeover", {"slot_id": f"{cid}-PE-4", "week": 1,
+                                       "subject": "数学", "ref": ""})
+            ledger.append("weather_trigger",
+                          {"occasion": Occasion(f"{cid}-PE-5", 1),
+                           "condition": "rain", "policy_ref": "POL-RAIN-01"})
+            rebuilt = ledger.rebuild_class(
+                cid, slots, HEADCOUNT, {}, {}, VENUES, current_week=1)
+            cov = compute_class_coverage(cid, rebuilt, (GOAL_BB,))
+            # 每班口径自洽：5 = 完成 3 + 待补 2
+            self.assertEqual((cov.total_occasions, cov.completed, cov.pending_makeup), (5, 3, 2))
+            evidence_total += len(cov.completion_evidence)
+            coverages[cid] = cov
+        return coverages
+
+    def test_public_totals_match_class_counts_and_evidence(self):
+        coverages = self._three_class_coverages()
+        summary = build_public_summary("S", coverages, {})
+        self.assertTrue(summary.published)
+        self.assertEqual(summary.classes_counted, 3)
+        self.assertAlmostEqual(summary.occasions_completed_ratio, 9 / 15)
+        # 待补共 6 场 >= 单元格抑制线 5，如实发布且与各班待补之和一致
+        self.assertEqual(summary.pending_makeup, 6)
+
+    def test_open_review_class_excluded_then_included_after_resolution(self):
+        coverages = self._three_class_coverages()
+        board = ReviewBoard()
+        case = board.open_case("C3", [])
+        # C3 复核未结案：整班排除，只剩 2 班 -> 抑制发布（不审不判）
+        suppressed = build_public_summary("S", coverages, {"C3": board.get(case.case_id)})
+        self.assertFalse(suppressed.published)
+        self.assertEqual(suppressed.classes_counted, 2)
+
+        board.resolve(case.case_id, ReviewStatus.CLEARED, "教研员", "天气替代有据")
+        summary = build_public_summary(
+            "S", coverages, {"C3": board.get(case.case_id)})
+        self.assertTrue(summary.published)
+        self.assertEqual(summary.classes_counted, 3)
+        self.assertAlmostEqual(summary.occasions_completed_ratio, 9 / 15)
+
+    def test_makeup_completion_flows_into_public_ratio_once(self):
+        # 一个班：原场次占课待补 -> 补课兑现；公众分母只计计划场次
+        cid = "C1"
+        slots = five_pe_slots(cid)
+        ledger = EventLedger()
+        original = Occasion("C1-PE-4", 1)
+        host = Occasion("C1-PE-1", 2)
+        ledger.append("takeover", {"slot_id": "C1-PE-4", "week": 1,
+                                   "subject": "数学", "ref": ""})
+        for day in (1, 2, 3, 5):
+            occ = Occasion(f"C1-PE-{day}", 1)
+            ledger.append("teacher_report", TeacherReport(
+                occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+                SessionMode.NORMAL, "V-FIELD"))
+            ledger.append("venue_observation", VenueObservation(occ, "V-FIELD", 40))
+            for i in range(4):
+                ledger.append("sample_attendance", att(f"t{i}", occ, "2026-09-07T10:00:00"))
+        ledger.append("makeup_plan", {"occasion": host, "makeup_for": original})
+        ledger.append("teacher_report", TeacherReport(
+            host, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+            SessionMode.MAKEUP, "V-GYM", basis_ref="MK-01", makeup_for=original))
+        ledger.append("venue_observation", VenueObservation(host, "V-GYM", 40))
+        for i in range(4):
+            ledger.append("sample_attendance", att(f"mk{i}", host, "2026-09-14T10:00:00"))
+        # 第 2 周其余 4 个计划场次正常交付（补课占用的是 PE-1 场次）
+        for day in (2, 3, 4, 5):
+            occ = Occasion(f"C1-PE-{day}", 2)
+            ledger.append("teacher_report", TeacherReport(
+                occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+                SessionMode.NORMAL, "V-FIELD"))
+            ledger.append("venue_observation", VenueObservation(occ, "V-FIELD", 40))
+            for i in range(4):
+                ledger.append("sample_attendance", att(f"w2t{i}", occ, "2026-09-14T10:00:00"))
+        rebuilt = ledger.rebuild_class(
+            cid, slots, HEADCOUNT, {}, {}, VENUES, current_week=2)
+        cov = compute_class_coverage(cid, rebuilt, (GOAL_BB,))
+        # 10 个计划场次（补课场次不另立分母），10 场全部完成，0 待补
+        self.assertEqual((cov.total_occasions, cov.completed, cov.pending_makeup), (10, 10, 0))
+        self.assertEqual(cov.completion_evidence, {"C1-PE-4#w1": "C1-PE-1#w2"})
+
+
 if __name__ == "__main__":
     unittest.main()
